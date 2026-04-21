@@ -1,0 +1,499 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<title>lgtk-clipper</title>
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<style>
+  :root {
+    color-scheme: light dark;
+    --fg: #1a1a1a;
+    --muted: #666;
+    --border: #ddd;
+    --row-alt: #f6f6f6;
+    --accent: #9146ff;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root { --fg: #eee; --muted: #999; --border: #333; --row-alt: #181818; }
+  }
+  body {
+    font: 14px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+    color: var(--fg);
+    max-width: 1100px;
+    margin: 1.5rem auto;
+    padding: 0 1rem;
+  }
+  h1 { font-size: 1.3rem; margin: 0 0 .25rem; }
+  .sub { color: var(--muted); margin-bottom: 1.25rem; }
+  fieldset { border: 1px solid var(--border); border-radius: 6px; margin: 0 0 1rem; padding: .75rem 1rem; }
+  legend { padding: 0 .35rem; font-weight: 600; }
+  label { display: inline-flex; flex-direction: column; gap: .2rem; margin: .25rem .75rem .25rem 0; font-size: 12px; color: var(--muted); }
+  input[type=text], input[type=number], input[type=url], input[type=password] {
+    font: inherit;
+    padding: .35rem .5rem;
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    background: transparent;
+    color: var(--fg);
+    min-width: 260px;
+  }
+  input[type=number] { min-width: 80px; }
+  button {
+    font: inherit; font-weight: 600;
+    padding: .4rem .9rem;
+    border: 0; border-radius: 4px;
+    background: var(--accent); color: white;
+    cursor: pointer;
+  }
+  button:disabled { opacity: .5; cursor: default; }
+  button.secondary { background: transparent; color: var(--accent); border: 1px solid var(--accent); }
+  a { color: var(--accent); }
+  .status { margin: .5rem 0 1rem; color: var(--muted); min-height: 1.2em; }
+  .status.error { color: #c33; }
+  table { border-collapse: collapse; width: 100%; margin-top: .5rem; }
+  th, td { padding: .45rem .6rem; border-bottom: 1px solid var(--border); text-align: left; vertical-align: top; }
+  th { font-size: 12px; text-transform: uppercase; letter-spacing: .05em; color: var(--muted); }
+  tr:nth-child(even) td { background: var(--row-alt); }
+  td.num { text-align: right; font-variant-numeric: tabular-nums; white-space: nowrap; }
+  td.title { max-width: 340px; }
+  td.url { font-size: 12px; word-break: break-all; }
+  .row { display: flex; flex-wrap: wrap; align-items: flex-end; gap: .25rem; }
+  .linkbtn {
+    background: none; border: 0; color: var(--accent);
+    padding: 0; font: inherit; cursor: pointer; text-decoration: underline;
+  }
+</style>
+</head>
+<body>
+<h1>lgtk-clipper</h1>
+<p class="sub">Rank viewer-made Twitch clips from a VOD by YouTube-worthiness.</p>
+
+<fieldset id="auth">
+  <legend>Twitch credentials</legend>
+  <div class="row">
+    <label>Client ID
+      <input type="text" id="clientId" autocomplete="off" spellcheck="false" />
+    </label>
+    <label>Access token
+      <input type="password" id="token" autocomplete="off" spellcheck="false" />
+    </label>
+    <button type="button" class="secondary" id="saveCreds">Save</button>
+    <button type="button" class="linkbtn" id="clearCreds">clear</button>
+  </div>
+  <p class="sub" style="margin:.5rem 0 0; font-size: 12px;">
+    Stored in <code>localStorage</code> on this device only. Generate a token with
+    <code>twitch token -u</code> (Twitch CLI) or the client-credentials curl from the README.
+  </p>
+</fieldset>
+
+<fieldset>
+  <legend>VOD</legend>
+  <form id="form" class="row">
+    <label style="flex: 1 1 380px;">VOD URL
+      <input type="url" id="vodUrl" required
+             placeholder="https://www.twitch.tv/videos/123456789" />
+    </label>
+    <label>Min views
+      <input type="number" id="minViews" value="0" min="0" />
+    </label>
+    <label>Limit
+      <input type="number" id="limit" value="20" min="1" />
+    </label>
+    <button type="submit" id="go">Analyze</button>
+  </form>
+</fieldset>
+
+<div id="status" class="status"></div>
+<div id="actions" class="row" hidden>
+  <button type="button" class="secondary" id="downloadJson">Download JSON</button>
+</div>
+<div id="results"></div>
+
+<script type="module">
+const HELIX = "https://api.twitch.tv/helix";
+const VOD_URL_RE = /twitch\.tv\/videos\/(\d+)/;
+const DURATION_RE = /^(?:(\d+)h)?(?:(\d+)m)?(?:(\d+)s)?$/;
+
+const CLUSTER_WINDOW_SEC = 30;
+const DURATION_SWEET_PEAK = 45;
+const DURATION_SWEET_MIN = 20;
+const DURATION_SWEET_MAX = 90;
+
+const WEIGHT_VIEWS = 0.50;
+const WEIGHT_DENSITY = 0.25;
+const WEIGHT_DURATION = 0.15;
+const WEIGHT_DIVERSITY = 0.10;
+
+const $ = (id) => document.getElementById(id);
+const round = (n, d) => {
+  const m = 10 ** d;
+  return Math.round(n * m) / m;
+};
+
+function parseVodId(url) {
+  const m = url.match(VOD_URL_RE);
+  if (!m) throw new Error(`Could not parse a Twitch VOD id from: ${url}`);
+  return m[1];
+}
+
+function parseDuration(s) {
+  const m = s.match(DURATION_RE);
+  if (!m) throw new Error(`Unparseable duration: ${s}`);
+  const h = m[1] ? parseInt(m[1], 10) : 0;
+  const mi = m[2] ? parseInt(m[2], 10) : 0;
+  const se = m[3] ? parseInt(m[3], 10) : 0;
+  return h * 3600 + mi * 60 + se;
+}
+
+async function helixGet(path, token, clientId, params) {
+  const url = new URL(HELIX + path);
+  for (const [k, v] of Object.entries(params)) url.searchParams.set(k, v);
+  const resp = await fetch(url, {
+    headers: { "Client-Id": clientId, "Authorization": `Bearer ${token}` },
+  });
+  if (resp.status === 401) {
+    throw new Error("Twitch API returned 401 — check your Client-ID and token.");
+  }
+  if (!resp.ok) {
+    throw new Error(`Twitch API error ${resp.status}: ${await resp.text()}`);
+  }
+  return resp.json();
+}
+
+async function fetchVod(vodId, token, clientId) {
+  const { data } = await helixGet("/videos", token, clientId, { id: vodId });
+  if (!data.length) throw new Error(`No VOD found with id ${vodId}.`);
+  return data[0];
+}
+
+function isoNoMillis(d) {
+  return d.toISOString().replace(/\.\d{3}Z$/, "Z");
+}
+
+async function fetchClips(broadcasterId, vodId, startedAt, endedAt, token, clientId, onProgress) {
+  const clips = [];
+  let cursor = null;
+  let pages = 0;
+  while (true) {
+    const params = {
+      broadcaster_id: broadcasterId,
+      started_at: isoNoMillis(startedAt),
+      ended_at: isoNoMillis(endedAt),
+      first: 100,
+    };
+    if (cursor) params.after = cursor;
+    const page = await helixGet("/clips", token, clientId, params);
+    for (const c of page.data) {
+      if (c.video_id !== vodId) continue;
+      clips.push({
+        id: c.id,
+        url: c.url,
+        title: c.title,
+        creator: c.creator_name || "",
+        views: parseInt(c.view_count ?? 0, 10),
+        duration: parseFloat(c.duration ?? 0),
+        vodOffset: c.vod_offset ?? null,
+        createdAt: c.created_at || "",
+      });
+    }
+    pages += 1;
+    onProgress?.(pages, clips.length);
+    cursor = page.pagination?.cursor;
+    if (!cursor) break;
+  }
+  return clips;
+}
+
+function durationScore(d) {
+  if (d <= DURATION_SWEET_MIN || d >= DURATION_SWEET_MAX) return 0;
+  if (d <= DURATION_SWEET_PEAK) {
+    return (d - DURATION_SWEET_MIN) / (DURATION_SWEET_PEAK - DURATION_SWEET_MIN);
+  }
+  return 1 - (d - DURATION_SWEET_PEAK) / (DURATION_SWEET_MAX - DURATION_SWEET_PEAK);
+}
+
+function computeClusters(clips) {
+  const positioned = clips.filter((c) => c.vodOffset !== null);
+  for (const clip of clips) {
+    if (clip.vodOffset === null) {
+      clip.density = 0;
+      clip.uniqueClippers = 1;
+      continue;
+    }
+    const neighbors = positioned.filter(
+      (other) =>
+        other.id !== clip.id &&
+        Math.abs(other.vodOffset - clip.vodOffset) <= CLUSTER_WINDOW_SEC,
+    );
+    clip.density = neighbors.length;
+    const clippers = new Set([clip.creator]);
+    for (const n of neighbors) if (n.creator) clippers.add(n.creator);
+    clip.uniqueClippers = clippers.size;
+  }
+}
+
+function scoreClips(clips) {
+  if (!clips.length) return;
+  computeClusters(clips);
+
+  const maxLogViews =
+    Math.max(...clips.map((c) => Math.log10(c.views + 1))) || 1;
+  const maxDensity = Math.max(0, ...clips.map((c) => c.density)) || 1;
+  const maxDiversity = Math.max(1, ...clips.map((c) => c.uniqueClippers)) || 1;
+
+  for (const c of clips) {
+    const viewsN = Math.log10(c.views + 1) / maxLogViews;
+    const densityN = c.density / maxDensity;
+    const durationN = durationScore(c.duration);
+    const diversityN = c.uniqueClippers / maxDiversity;
+
+    c.components = {
+      views: round(viewsN, 3),
+      density: round(densityN, 3),
+      duration: round(durationN, 3),
+      diversity: round(diversityN, 3),
+    };
+    c.score = round(
+      100 *
+        (WEIGHT_VIEWS * viewsN +
+          WEIGHT_DENSITY * densityN +
+          WEIGHT_DURATION * durationN +
+          WEIGHT_DIVERSITY * diversityN),
+      2,
+    );
+  }
+}
+
+function fmtTimestamp(seconds) {
+  if (seconds === null || seconds === undefined) return "—";
+  const s = Math.floor(seconds);
+  const h = Math.floor(s / 3600);
+  const m = Math.floor((s % 3600) / 60);
+  const sec = s % 60;
+  return `${h}:${String(m).padStart(2, "0")}:${String(sec).padStart(2, "0")}`;
+}
+
+function vodTimestampUrl(vodUrl, offset) {
+  if (offset === null || offset === undefined) return vodUrl;
+  const o = Math.floor(offset);
+  const h = Math.floor(o / 3600);
+  const m = Math.floor((o % 3600) / 60);
+  const s = o % 60;
+  const parts = [];
+  if (h) parts.push(`${h}h`);
+  if (m) parts.push(`${m}m`);
+  parts.push(`${s}s`);
+  const sep = vodUrl.includes("?") ? "&" : "?";
+  return `${vodUrl}${sep}t=${parts.join("")}`;
+}
+
+function renderTable(clips, vodUrl, limit) {
+  const results = $("results");
+  results.textContent = "";
+  if (!clips.length) return;
+
+  const caption = document.createElement("p");
+  caption.className = "sub";
+  caption.textContent = `Top ${Math.min(limit, clips.length)} clips (of ${clips.length})`;
+  results.appendChild(caption);
+
+  const table = document.createElement("table");
+  const thead = document.createElement("thead");
+  thead.innerHTML =
+    "<tr><th>#</th><th>Score</th><th>Title</th><th>Views</th><th>Dur</th><th>VOD @</th><th>Clip</th></tr>";
+  table.appendChild(thead);
+
+  const tbody = document.createElement("tbody");
+  clips.slice(0, limit).forEach((c, i) => {
+    const tr = document.createElement("tr");
+
+    const rank = document.createElement("td");
+    rank.className = "num";
+    rank.textContent = String(i + 1);
+    tr.appendChild(rank);
+
+    const score = document.createElement("td");
+    score.className = "num";
+    score.textContent = c.score.toFixed(1);
+    tr.appendChild(score);
+
+    const title = document.createElement("td");
+    title.className = "title";
+    title.textContent = c.title;
+    tr.appendChild(title);
+
+    const views = document.createElement("td");
+    views.className = "num";
+    views.textContent = c.views.toLocaleString();
+    tr.appendChild(views);
+
+    const dur = document.createElement("td");
+    dur.className = "num";
+    dur.textContent = `${Math.round(c.duration)}s`;
+    tr.appendChild(dur);
+
+    const vodAt = document.createElement("td");
+    vodAt.className = "num";
+    const vodLink = document.createElement("a");
+    vodLink.href = vodTimestampUrl(vodUrl, c.vodOffset);
+    vodLink.target = "_blank";
+    vodLink.rel = "noopener";
+    vodLink.textContent = fmtTimestamp(c.vodOffset);
+    vodAt.appendChild(vodLink);
+    tr.appendChild(vodAt);
+
+    const clipTd = document.createElement("td");
+    clipTd.className = "url";
+    const clipLink = document.createElement("a");
+    clipLink.href = c.url;
+    clipLink.target = "_blank";
+    clipLink.rel = "noopener";
+    clipLink.textContent = c.url;
+    clipTd.appendChild(clipLink);
+    tr.appendChild(clipTd);
+
+    tbody.appendChild(tr);
+  });
+  table.appendChild(tbody);
+  results.appendChild(table);
+}
+
+function buildJsonReport(clips, vodUrl) {
+  return {
+    vod_url: vodUrl,
+    clips: clips.map((c, i) => ({
+      rank: i + 1,
+      score: c.score,
+      components: c.components,
+      title: c.title,
+      creator: c.creator,
+      views: c.views,
+      duration_sec: c.duration,
+      vod_offset_sec: c.vodOffset,
+      vod_timestamp_url: vodTimestampUrl(vodUrl, c.vodOffset),
+      clip_url: c.url,
+      clip_id: c.id,
+      created_at: c.createdAt,
+      density: c.density,
+      unique_clippers: c.uniqueClippers,
+    })),
+  };
+}
+
+async function analyze({ vodUrl, clientId, token, minViews, limit, status }) {
+  const vodId = parseVodId(vodUrl);
+  status("Fetching VOD metadata…");
+  const vod = await fetchVod(vodId, token, clientId);
+  const createdAt = new Date(vod.created_at);
+  const durationSec = parseDuration(vod.duration);
+  const startedAt = new Date(createdAt.getTime() - 60_000);
+  const endedAt = new Date(
+    createdAt.getTime() + durationSec * 1000 + 5 * 60_000,
+  );
+
+  const all = await fetchClips(
+    vod.user_id,
+    vodId,
+    startedAt,
+    endedAt,
+    token,
+    clientId,
+    (pages, count) => status(`Fetching clips… ${count} so far (page ${pages})`),
+  );
+  const clips = all.filter((c) => c.views >= minViews);
+  if (!clips.length) {
+    renderTable([], vodUrl, limit);
+    return { vod, clips: [] };
+  }
+  scoreClips(clips);
+  clips.sort((a, b) => b.score - a.score);
+  renderTable(clips, vodUrl, limit);
+  return { vod, clips };
+}
+
+const LS_CLIENT = "lgtk.clientId";
+const LS_TOKEN = "lgtk.token";
+
+function loadCreds() {
+  $("clientId").value = localStorage.getItem(LS_CLIENT) || "";
+  $("token").value = localStorage.getItem(LS_TOKEN) || "";
+}
+function saveCreds() {
+  localStorage.setItem(LS_CLIENT, $("clientId").value.trim());
+  localStorage.setItem(LS_TOKEN, $("token").value.trim());
+  setStatus("Credentials saved to this browser.", false);
+}
+function clearCreds() {
+  localStorage.removeItem(LS_CLIENT);
+  localStorage.removeItem(LS_TOKEN);
+  $("clientId").value = "";
+  $("token").value = "";
+  setStatus("Credentials cleared.", false);
+}
+
+function setStatus(msg, isError) {
+  const el = $("status");
+  el.textContent = msg;
+  el.classList.toggle("error", !!isError);
+}
+
+let lastReport = null;
+let lastVodUrl = null;
+
+$("saveCreds").addEventListener("click", saveCreds);
+$("clearCreds").addEventListener("click", clearCreds);
+
+$("form").addEventListener("submit", async (e) => {
+  e.preventDefault();
+  const clientId = $("clientId").value.trim();
+  const token = $("token").value.trim();
+  if (!clientId || !token) {
+    setStatus("Enter a Client-ID and access token first.", true);
+    return;
+  }
+  const vodUrl = $("vodUrl").value.trim();
+  const minViews = parseInt($("minViews").value || "0", 10);
+  const limit = Math.max(1, parseInt($("limit").value || "20", 10));
+  $("go").disabled = true;
+  $("actions").hidden = true;
+  setStatus("Working…", false);
+  try {
+    const { clips } = await analyze({
+      vodUrl, clientId, token, minViews, limit,
+      status: (m) => setStatus(m, false),
+    });
+    if (!clips.length) {
+      setStatus("No clips found for this VOD.", false);
+    } else {
+      setStatus(`Ranked ${clips.length} clips.`, false);
+      lastReport = buildJsonReport(clips, vodUrl);
+      lastVodUrl = vodUrl;
+      $("actions").hidden = false;
+    }
+    if (!localStorage.getItem(LS_CLIENT)) saveCreds();
+  } catch (err) {
+    setStatus(err.message || String(err), true);
+  } finally {
+    $("go").disabled = false;
+  }
+});
+
+$("downloadJson").addEventListener("click", () => {
+  if (!lastReport) return;
+  const blob = new Blob([JSON.stringify(lastReport, null, 2)], {
+    type: "application/json",
+  });
+  const vodId = lastVodUrl.match(VOD_URL_RE)?.[1] ?? "report";
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(blob);
+  a.download = `clipper-${vodId}.json`;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  URL.revokeObjectURL(a.href);
+});
+
+loadCreds();
+</script>
+</body>
+</html>

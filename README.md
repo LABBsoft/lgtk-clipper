@@ -56,6 +56,30 @@ python clipper.py https://www.twitch.tv/videos/123456789 \
   --min-views 25 --limit 15 --json last_stream.json
 ```
 
+## Browser version
+
+`clipper.html` is a zero-build, single-file version that runs locally. Open
+it directly (`file://…/clipper.html`) — no server, no dependencies.
+
+Because it runs in the browser, the client-credentials flow the Python
+CLI uses isn't available (the token endpoint doesn't send CORS headers,
+and shipping a client secret in HTML is unsafe). Instead, paste a
+pre-generated access token:
+
+- With the [Twitch CLI](https://dev.twitch.tv/docs/cli/):
+  ```bash
+  twitch token
+  ```
+- Or one-shot via curl, using the same credentials as `.env`:
+  ```bash
+  curl -X POST https://id.twitch.tv/oauth2/token \
+    -d "client_id=$TWITCH_CLIENT_ID&client_secret=$TWITCH_CLIENT_SECRET&grant_type=client_credentials"
+  ```
+
+Paste the Client ID and the resulting `access_token` into the page.
+Both are cached in `localStorage` on that device only; a "clear" link
+wipes them. The scoring and JSON output match the CLI exactly.
+
 ## How clips are scored
 
 Each clip gets a composite 0–100 score:
